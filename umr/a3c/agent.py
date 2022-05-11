@@ -5,8 +5,21 @@ import json
 import zmq
 import queue
 import gym
+import numpy as np
 from umr.utils import logger
 from umr.utils import get_gym_env
+
+
+class TransitionExperience(object):
+    """ A transition of state, or experience"""
+
+    def __init__(self, state, action, reward, **kwargs):
+        """ kwargs: whatever other attribute you want to save"""
+        self.state = state
+        self.action = action
+        self.reward = reward
+        for k, v in kwargs.items():
+            setattr(self, k, v)
 
 
 class AgentWorker(Process):
@@ -49,8 +62,9 @@ class AgentMaster(Thread):
             self.memory = []  # list of Experience
             self.ident = None
 
-    def __int__(self, url_c2s: str, url_s2c: str, batch_size=128):
+    def __int__(self, model, url_c2s: str, url_s2c: str, batch_size=128):
         super(AgentMaster, self).__int__()
+        self.model = model
         self.daemon = True
         self.name = 'Master'
         # zmq socket
@@ -76,6 +90,8 @@ class AgentMaster(Thread):
         self.send_thread.setDaemon(True)
         self.send_thread.start()
 
+        # self.predict_queue = queue.Queue()
+
     def run(self) -> None:
         self.clients = defaultdict(self.ClientState)
         try:
@@ -87,7 +103,27 @@ class AgentMaster(Thread):
                     client.ident = ident
                 # predict the action, put in the send_queue
                 # collect the experience generate the train batch for update model
-                self._process_msg(client, state, reward, done)
+                distrib, value = self.model([state])
+                action = np.random.choice(len(distrib), p=distrib[0])
+                self.send_queue.put([client.ident, json.dumps(action)])
+                if len(client.memory) > 0:
+                    client.memory[-1].reward = reward
+                    if done:
+                        # should clear client's memory and put to queue
+                        self._parse_memory(0, client, True)
+                    else:
+                        if len(client.memory) == LOCAL_TIME_MAX + 1:
+                            R = client.memory[-1].value
+                            self._parse_memory(R, client, False)
+                client.memory.append(
+                        TransitionExperience(state, action, reward=None, value=value[0], prob=distrib[0][action]))
+
+                # self._process_msg(client, state, reward, done)
         except zmq.ContextTerminated:
             logger.info("[Simulator] Context was terminated.")
 
+    def _process(self):
+        pass
+
+    def loss(self):
+        pass
