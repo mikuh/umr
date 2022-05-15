@@ -2,10 +2,9 @@ import tensorflow as tf
 
 
 class A3C(tf.keras.Model):
-
-    def __int__(self, action_size: int, image_size=(84, 84), frame_history=4):
-        super(A3C, self).__int__()
-        self.reshape_size = (-1, *self.image_size, 3 * frame_history)
+    def __init__(self, action_size: int, image_size=(84, 84), frame_history=4):
+        super(A3C, self).__init__()
+        self.reshape_size = (-1, *image_size, 3 * frame_history)
         self.normalization = tf.keras.layers.Rescaling(1. / 255)
         self.conv1 = tf.keras.layers.Conv2D(32, (5, 5), activation='relu')
         self.maxp1 = tf.keras.layers.MaxPool2D((2, 2))
@@ -22,6 +21,7 @@ class A3C(tf.keras.Model):
         self.policy = tf.keras.layers.Dense(action_size, activation='softmax')
         self.value = tf.keras.layers.Dense(1)
 
+    @tf.function()
     def call(self, state):
         assert state.shape.rank == 5  # Batch, H, W, Channel, History
         state = tf.transpose(state, [0, 1, 2, 4, 3])  # swap channel & history
@@ -45,7 +45,5 @@ class A3C(tf.keras.Model):
         return policy, value
 
 
-class A3Clstm(tf.keras.Model):
-
-    def __int__(self):
-        pass
+class A3Clstm(object):
+    pass

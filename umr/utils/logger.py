@@ -6,12 +6,12 @@ __all__ = []
 
 def _getlogger():
     # this file is synced to "dataflow" package as well
-    package_name = "umr"
+    package_name = "UMR"
     logger = logging.getLogger(package_name)
     logger.propagate = False
     logger.setLevel(logging.INFO)
     handler = logging.StreamHandler(sys.stdout)
-    handler.setFormatter('%(asctime)s  %(name)s  %(levelname)s: %(message)s')
+    handler.setFormatter(logging.Formatter('%(asctime)s  %(name)s  %(levelname)s: %(message)s'))
     logger.addHandler(handler)
     return logger
 
