@@ -219,8 +219,8 @@ class AgentMaster(Thread):
         dataset = self.get_training_dataflow()
         step = 0
         for epoch in range(1, 100):
-            step += 1
             for data in tqdm(dataset.take(self.args.epoch_size), total=self.args.epoch_size, desc=f"EPOCH {epoch}"):
+                step += 1
                 loss, policy_loss, value_loss, advantage = self.__train_step(data)
                 self.writer.add_scalar('train/loss', loss.numpy(), step)
                 self.writer.add_scalar('train/policy_loss', policy_loss.numpy(), step)
