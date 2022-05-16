@@ -89,6 +89,7 @@ class AgentMaster(Thread):
         def full(self):
             return self.size == self.max_size
 
+        @tf.function
         def predict(self, model):
             return model(np.array(self.states))
 
@@ -111,7 +112,7 @@ class AgentMaster(Thread):
         self.s2c_socket.set_hwm(10)
 
         # queueing messages to client
-        self.send_queue = queue.Queue(maxsize=args.batch_size * 8 * 2)
+        self.send_queue = queue.Queue(maxsize=args.batch_size)
         self.args = args
 
         def send_loop():
@@ -123,7 +124,7 @@ class AgentMaster(Thread):
         self.send_thread.setDaemon(True)
         self.send_thread.start()
 
-        self.queue = queue.Queue(maxsize=args.epoch_size * 4)
+        self.queue = queue.Queue(maxsize=args.batch_size * args.predict_batch_size)
         self.predict_batch = self.PredictBatch(args.predict_batch_size)
         self.score = deque(maxlen=50)
 
@@ -196,7 +197,7 @@ class AgentMaster(Thread):
                                                                 )).batch(
             self.args.batch_size).prefetch(self.args.epoch_size)  # .cache().prefetch(tf.data.AUTOTUNE)
 
-    @tf.function()
+    @tf.function
     def __train_step(self, data):
         state, action, target_value, action_prob = data
         with tf.GradientTape() as tape:
@@ -239,7 +240,7 @@ if __name__ == '__main__':
 
     parser = argparse.ArgumentParser()
     parser.add_argument('--env_name', '--env', help='env name', default='ALE/Breakout-v5')
-    parser.add_argument('--workers', default=mp.cpu_count() * 2)
+    parser.add_argument('--workers', default=mp.cpu_count())
     parser.add_argument('--frame_history', '--history', default=4)
     parser.add_argument('--render_mode', '--em', help='env mode', default=None)
     parser.add_argument('--url_c2s', help='zmq pipeline url c2s', default='ipc://agent-c2s')
