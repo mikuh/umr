@@ -145,6 +145,8 @@ class AgentMaster(Thread):
                 # collect the experience generate the train batch for update model
                 distrib_batch, value_batch = self.predict_batch.predict(model=self.model)
                 for distrib, value, client in zip(distrib_batch, value_batch, self.predict_batch.clients):
+                    action = np.random.choice(self.args.action_size, p=distrib.numpy())
+                    self.send_queue.put([client.ident, pickle.dumps(action)])
                     if len(client.memory) > 0:
                         client.memory[-1].reward = reward
                         if done:
@@ -154,10 +156,9 @@ class AgentMaster(Thread):
                             if len(client.memory) == self.args.local_time_max + 1:
                                 R = client.memory[-1].value
                                 self._parse_memory(R, client, False)
-                    action = np.random.choice(self.args.action_size, p=distrib.numpy())
+
                     client.memory.append(Experience(state=state, action=action, reward=None, value=value[0],
                                                     action_prob=distrib[action]))
-                    self.send_queue.put([client.ident, pickle.dumps(action)])
                 self.predict_batch.reset()
 
     def _parse_memory(self, init_r, client, done):
