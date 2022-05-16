@@ -89,7 +89,6 @@ class AgentMaster(Thread):
         def full(self):
             return self.size == self.max_size
 
-        @tf.function
         def predict(self, model):
             return model(np.array(self.states))
 
@@ -124,7 +123,7 @@ class AgentMaster(Thread):
         self.send_thread.setDaemon(True)
         self.send_thread.start()
 
-        self.queue = queue.Queue(maxsize=args.epoch_size * 5)
+        self.queue = queue.Queue(maxsize=args.epoch_size * 4)
         self.predict_batch = self.PredictBatch(args.predict_batch_size)
         self.score = deque(maxlen=50)
 
@@ -146,8 +145,6 @@ class AgentMaster(Thread):
                 # collect the experience generate the train batch for update model
                 distrib_batch, value_batch = self.predict_batch.predict(model=self.model)
                 for distrib, value, client in zip(distrib_batch, value_batch, self.predict_batch.clients):
-                    action = np.random.choice(self.args.action_size, p=distrib.numpy())
-                    self.send_queue.put([client.ident, pickle.dumps(action)])
                     if len(client.memory) > 0:
                         client.memory[-1].reward = reward
                         if done:
@@ -157,9 +154,10 @@ class AgentMaster(Thread):
                             if len(client.memory) == self.args.local_time_max + 1:
                                 R = client.memory[-1].value
                                 self._parse_memory(R, client, False)
-                    client.memory.append(
-                        Experience(state=state, action=action, reward=None, value=value[0],
-                                   action_prob=distrib[action]))
+                    action = np.random.choice(self.args.action_size, p=distrib.numpy())
+                    client.memory.append(Experience(state=state, action=action, reward=None, value=value[0],
+                                                    action_prob=distrib[action]))
+                    self.send_queue.put([client.ident, pickle.dumps(action)])
                 self.predict_batch.reset()
 
     def _parse_memory(self, init_r, client, done):
@@ -197,7 +195,7 @@ class AgentMaster(Thread):
                                                                 )).batch(
             self.args.batch_size).prefetch(self.args.epoch_size)  # .cache().prefetch(tf.data.AUTOTUNE)
 
-    # @tf.function()
+    @tf.function()
     def __train_step(self, data):
         state, action, target_value, action_prob = data
         with tf.GradientTape() as tape:
@@ -211,7 +209,7 @@ class AgentMaster(Thread):
             policy_loss = -tf.reduce_sum(log_pi_a_given_s * tf.stop_gradient(advantage) * importance)
             entropy_loss = tf.reduce_sum(policy * log_probs)
             value_loss = tf.nn.l2_loss(advantage)
-            loss = tf.add_n([policy_loss, entropy_loss * 0.01, value_loss])
+            loss = tf.add_n([policy_loss, entropy_loss * 0.01, value_loss]) / self.args.batch_size
         grads = tape.gradient(loss, self.model.trainable_variables)
         self.optimizer.apply_gradients(zip(grads, self.model.trainable_variables))
         return loss, policy_loss, value_loss, tf.reduce_mean(advantage)
@@ -240,13 +238,13 @@ if __name__ == '__main__':
 
     parser = argparse.ArgumentParser()
     parser.add_argument('--env_name', '--env', help='env name', default='ALE/Breakout-v5')
-    parser.add_argument('--workers', default=mp.cpu_count())
+    parser.add_argument('--workers', default=mp.cpu_count() * 2)
     parser.add_argument('--frame_history', '--history', default=4)
     parser.add_argument('--render_mode', '--em', help='env mode', default=None)
     parser.add_argument('--url_c2s', help='zmq pipeline url c2s', default='ipc://agent-c2s')
     parser.add_argument('--url_s2c', help='zmq pipeline url s2c', default='ipc://agent-s2c')
     parser.add_argument('--batch_size', default=128)
-    parser.add_argument('--predict_batch_size', default=mp.cpu_count()//2)
+    parser.add_argument('--predict_batch_size', default=16)
     parser.add_argument('--epoch_size', default=1000)
     parser.add_argument('--local_time_max', default=5)
     parser.add_argument('--gamma', default=0.99)
