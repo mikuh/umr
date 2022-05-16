@@ -99,7 +99,7 @@ class AgentMaster(Thread):
         self.args = args
         self.daemon = True
         self.name = 'Master'
-        self.optimizer = tf.keras.optimizers.Adam(learning_rate=args.lr)
+        self.optimizer = tf.keras.optimizers.Adam(learning_rate=args.lr, epsilon=1e-3)
         # zmq socket
         self.context = zmq.Context()
         # receive the state, reward, done
@@ -195,25 +195,26 @@ class AgentMaster(Thread):
                                                                 tf.TensorSpec(shape=(), dtype=tf.float32),
                                                                 tf.TensorSpec(shape=(), dtype=tf.float32),
                                                                 )).batch(
-            self.args.batch_size)  # .cache().prefetch(tf.data.AUTOTUNE)
+            self.args.batch_size).prefetch(self.args.epoch_size)  # .cache().prefetch(tf.data.AUTOTUNE)
 
-    @tf.function()
+    # @tf.function()
     def __train_step(self, data):
         state, action, target_value, action_prob = data
         with tf.GradientTape() as tape:
             policy, value = self.model(state)
-            adv = tf.subtract(target_value, tf.stop_gradient(value))
+            value = tf.squeeze(value, [1])  # (B,)
+            advantage = tf.subtract(target_value, value)  # (B,)
             log_probs = tf.math.log(policy + 1e-6)
             log_pi_a_given_s = tf.reduce_sum(log_probs * tf.one_hot(action, self.args.action_size), 1)
             pi_a_given_s = tf.reduce_sum(policy * tf.one_hot(action, self.args.action_size), 1)
             importance = tf.stop_gradient(tf.clip_by_value(pi_a_given_s / (action_prob + 1e-8), 0, 10))
-            policy_loss = tf.reduce_sum(log_pi_a_given_s * adv * importance)
+            policy_loss = -tf.reduce_sum(log_pi_a_given_s * tf.stop_gradient(advantage) * importance)
             entropy_loss = tf.reduce_sum(policy * log_probs)
-            value_loss = tf.nn.l2_loss(tf.subtract(target_value, value))
-            loss = tf.reduce_mean([-policy_loss, entropy_loss * 0.01, value_loss])
+            value_loss = tf.nn.l2_loss(advantage)
+            loss = tf.add_n([policy_loss, entropy_loss * 0.01, value_loss])
         grads = tape.gradient(loss, self.model.trainable_variables)
         self.optimizer.apply_gradients(zip(grads, self.model.trainable_variables))
-        return loss, policy_loss, value_loss, tf.reduce_mean(tf.square(adv))
+        return loss, policy_loss, value_loss, tf.reduce_mean(advantage)
 
     def learn(self):
         dataset = self.get_training_dataflow()
@@ -222,10 +223,10 @@ class AgentMaster(Thread):
             for data in tqdm(dataset.take(self.args.epoch_size), total=self.args.epoch_size, desc=f"EPOCH {epoch}"):
                 step += 1
                 loss, policy_loss, value_loss, advantage = self.__train_step(data)
-                self.writer.add_scalar('train/loss', loss.numpy(), step)
-                self.writer.add_scalar('train/policy_loss', policy_loss.numpy(), step)
-                self.writer.add_scalar('train/value_loss', value_loss.numpy(), step)
-                self.writer.add_scalar('train/advantage', advantage.numpy(), step)
+            self.writer.add_scalar('train/loss', loss.numpy(), step)
+            self.writer.add_scalar('train/policy_loss', policy_loss.numpy(), step)
+            self.writer.add_scalar('train/value_loss', value_loss.numpy(), step)
+            self.writer.add_scalar('train/advantage', advantage.numpy(), step)
             mean_score = sum(self.score) / 50
             max_score = max(self.score)
             logger.info(f"EPOCH:{epoch}, Mean Score: {mean_score}, Max Score: {max_score}")
@@ -239,14 +240,14 @@ if __name__ == '__main__':
 
     parser = argparse.ArgumentParser()
     parser.add_argument('--env_name', '--env', help='env name', default='ALE/Breakout-v5')
-    parser.add_argument('--workers', default=mp.cpu_count()*2)
+    parser.add_argument('--workers', default=mp.cpu_count())
     parser.add_argument('--frame_history', '--history', default=4)
     parser.add_argument('--render_mode', '--em', help='env mode', default=None)
     parser.add_argument('--url_c2s', help='zmq pipeline url c2s', default='ipc://agent-c2s')
     parser.add_argument('--url_s2c', help='zmq pipeline url s2c', default='ipc://agent-s2c')
     parser.add_argument('--batch_size', default=128)
-    parser.add_argument('--predict_batch_size', default=16)
-    parser.add_argument('--epoch_size', default=6000)
+    parser.add_argument('--predict_batch_size', default=mp.cpu_count()//2)
+    parser.add_argument('--epoch_size', default=1000)
     parser.add_argument('--local_time_max', default=5)
     parser.add_argument('--gamma', default=0.99)
     parser.add_argument('--lr', default=0.001)
