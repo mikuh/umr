@@ -107,7 +107,7 @@ class AgentMaster(Thread):
         self.s2c_socket.set_hwm(10)
 
         # queueing messages to client
-        self.send_queue = queue.Queue(maxsize=args.batch_size * 8 * 2)
+        self.send_queue = queue.Queue(maxsize=args.batch_size)
         self.args = args
 
         def send_loop():
@@ -119,7 +119,7 @@ class AgentMaster(Thread):
         self.send_thread.setDaemon(True)
         self.send_thread.start()
 
-        self.queue = queue.Queue(maxsize=args.epoch_size * 5)
+        self.queue = queue.Queue(maxsize=args.batch_size * args.predict_batch_size)
         self.score = deque(maxlen=50)
         self.predictors = self.Predictor(args.predict_batch_size, self.model)
 
@@ -191,7 +191,7 @@ class AgentMaster(Thread):
                                                                 )).batch(
             self.args.batch_size).prefetch(self.args.epoch_size)  # .cache().prefetch(tf.data.AUTOTUNE)
 
-    # @tf.function()
+    @tf.function
     def __train_step(self, data):
         state, action, target_value, action_prob = data
         with tf.GradientTape() as tape:
@@ -235,13 +235,13 @@ if __name__ == '__main__':
 
     parser = argparse.ArgumentParser()
     parser.add_argument('--env_name', '--env', help='env name', default='ALE/Breakout-v5')
-    parser.add_argument('--workers', default=mp.cpu_count() // 2)
+    parser.add_argument('--workers', default=mp.cpu_count())
     parser.add_argument('--frame_history', '--history', default=4)
     parser.add_argument('--render_mode', '--em', help='env mode', default=None)
     parser.add_argument('--url_c2s', help='zmq pipeline url c2s', default='ipc://agent-c2s')
     parser.add_argument('--url_s2c', help='zmq pipeline url s2c', default='ipc://agent-s2c')
     parser.add_argument('--batch_size', default=128)
-    parser.add_argument('--predict_batch_size', default=mp.cpu_count() // 4)
+    parser.add_argument('--predict_batch_size', default=mp.cpu_count()//2)
     parser.add_argument('--epoch_size', default=1000)
     parser.add_argument('--local_time_max', default=5)
     parser.add_argument('--gamma', default=0.99)
