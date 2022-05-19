@@ -79,7 +79,7 @@ class AgentMaster(Thread):
 
         @tf.function
         def _predict(self, state):
-            self.model.make_predict_function()
+            # self.model.make_predict_function()
             logits, value = self.model(state)
             distrib = tf.nn.softmax(logits)
             action = tf.random.categorical(logits, 1)[0, 0]
@@ -194,10 +194,10 @@ class AgentMaster(Thread):
                                                                 tf.TensorSpec(shape=(), dtype=tf.float32),
                                                                 tf.TensorSpec(shape=(), dtype=tf.float32),
                                                                 )).batch(
-            self.args.batch_size).prefetch(self.args.batch_size)  # .cache().prefetch(tf.data.AUTOTUNE)
+            self.args.batch_size).prefetch(self.args.epoch_size)  # .cache().prefetch(tf.data.AUTOTUNE)
 
     @tf.function
-    def __train_step(self, data):
+    def __train_step(self, data, epoch):
         state, action, target_value, action_prob = data
         with tf.GradientTape() as tape:
             logits, value = self.model(state)
@@ -208,8 +208,8 @@ class AgentMaster(Thread):
             log_pi_a_given_s = tf.reduce_sum(log_probs * tf.one_hot(action, self.args.action_size), 1)  # (B,)
             pi_a_given_s = tf.reduce_sum(policy * tf.one_hot(action, self.args.action_size), 1)
             importance = tf.stop_gradient(tf.clip_by_value(pi_a_given_s / (action_prob + 1e-8), 0, 10))
-            policy_loss = tf.reduce_mean(log_pi_a_given_s * (-1 * advantage) * importance)
-            entropy_loss = tf.reduce_mean(policy * log_probs) * 0.002
+            policy_loss = -tf.reduce_mean(log_pi_a_given_s * advantage * importance)
+            entropy_loss = tf.reduce_mean(policy * log_probs) * get_beta(epoch)
             value_loss = tf.nn.l2_loss(value - target_value) / self.args.batch_size
             loss = tf.add_n([policy_loss, entropy_loss, value_loss])
         grads = tape.gradient(loss, self.model.trainable_variables)
@@ -219,11 +219,15 @@ class AgentMaster(Thread):
 
     def learn(self):
         dataset = self.get_training_dataflow()
+        iterator = iter(dataset)
         step = 0
         for epoch in range(1, 600):
             for data in tqdm(dataset.take(self.args.epoch_size), total=self.args.epoch_size, desc=f"Epoch {epoch}"):
                 step += 1
-                loss, policy_loss, value_loss, advantage, importance, entropy_loss, value = self.__train_step(data)
+                loss, policy_loss, value_loss, advantage, importance, entropy_loss, value = self.__train_step(data, epoch)
+            mean_score = np.mean(self.score)
+            max_score = max(self.score)
+            logger.info(f"EPOCH:{epoch}, Mean Score: {mean_score}, Max Score: {max_score}")
             self.writer.add_scalar('train/loss', loss.numpy(), step)
             self.writer.add_scalar('train/policy_loss', policy_loss.numpy(), step)
             self.writer.add_scalar('train/value_loss', value_loss.numpy(), step)
@@ -231,9 +235,6 @@ class AgentMaster(Thread):
             self.writer.add_scalar('train/importance', importance.numpy(), step)
             self.writer.add_scalar('train/entropy_loss', entropy_loss.numpy(), step)
             self.writer.add_scalar('train/entropy_loss', entropy_loss.numpy(), step)
-            mean_score = np.mean(self.score)
-            max_score = max(self.score)
-            logger.info(f"EPOCH:{epoch}, Mean Score: {mean_score}, Max Score: {max_score}")
             self.writer.add_scalar('client/mean_score', mean_score, step)
             self.writer.add_scalar('client/max_score', max_score, step)
             self.writer.add_scalar('client/episode_steps', np.mean(self.episode_steps), self.episode)
@@ -241,12 +242,23 @@ class AgentMaster(Thread):
             self.model.save_weights(os.path.join(self.log_dir, 'checkpoints'))
 
 
+def get_beta(epoch):
+    if epoch < 30:
+        return 0.002
+    elif epoch < 60:
+        return 0.001
+    elif epoch < 90:
+        return 0.0005
+    else:
+        return 0.0001
+
+
 if __name__ == '__main__':
     from umr.a3c.model import A3C
 
     parser = argparse.ArgumentParser()
     parser.add_argument('--env_name', '--env', help='env name', default='ALE/Breakout-v5')
-    parser.add_argument('--workers', default=mp.cpu_count())
+    parser.add_argument('--workers', default=mp.cpu_count()*2)
     parser.add_argument('--frame_history', '--history', default=4)
     parser.add_argument('--render_mode', '--em', help='env mode', default=None)
     parser.add_argument('--url_c2s', help='zmq pipeline url c2s', default='ipc://agent-c2s')
@@ -256,7 +268,8 @@ if __name__ == '__main__':
     parser.add_argument('--epoch_size', default=1000)
     parser.add_argument('--local_time_max', default=5)
     parser.add_argument('--gamma', default=0.99)
-    parser.add_argument('--lr', default=0.001)
+    parser.add_argument('--lr', default=tf.keras.optimizers.schedules.ExponentialDecay(0.001, decay_steps=10000,
+                                                                                       decay_rate=0.95, staircase=True))
     parser.add_argument('--log_dir', default='train_log')
     args = parser.parse_args()
     args.action_size = get_gym_env(args.env_name).action_space.n
