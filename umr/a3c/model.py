@@ -18,7 +18,7 @@ class A3C(tf.keras.Model):
         self.fc = tf.keras.layers.Dense(512)
         self.prelu = tf.keras.layers.PReLU()
 
-        self.policy = tf.keras.layers.Dense(action_size, activation='softmax')
+        self.logits = tf.keras.layers.Dense(action_size)
         self.value = tf.keras.layers.Dense(1)
 
     @tf.function()
@@ -39,10 +39,10 @@ class A3C(tf.keras.Model):
         x = self.fc(x)
         x = self.prelu(x)
 
-        policy = self.policy(x)
+        logits = self.logits(x)
         value = self.value(x)
 
-        return policy, value
+        return logits, value
 
 
 class A3Clstm(object):

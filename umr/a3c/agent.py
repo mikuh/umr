@@ -3,6 +3,7 @@ from tensorboardX import SummaryWriter
 import multiprocessing as mp
 from threading import Thread
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 import pickle
 import zmq
 import queue
@@ -69,29 +70,23 @@ class AgentMaster(Thread):
             self.ident = None
             self.score = 0
 
-    class PredictBatch(object):
-        def __init__(self, max_len):
-            self.clients = []
-            self.states = []
-            self.size = 0
-            self.max_size = max_len
+    class Predictor(object):
 
-        def add(self, client, state):
-            self.clients.append(client)
-            self.states.append(state)
-            self.size += 1
-
-        def reset(self):
-            self.clients = []
-            self.states = []
-            self.size = 0
-
-        def full(self):
-            return self.size == self.max_size
+        def __init__(self, workers, model):
+            self.pool = ThreadPoolExecutor(max_workers=workers)
+            self.model = model
 
         @tf.function
-        def predict(self, model):
-            return model(np.array(self.states))
+        def _predict(self, state):
+            self.model.make_predict_function()
+            logits, value = self.model(state)
+            distrib = tf.nn.softmax(logits)
+            action = tf.random.categorical(logits, 1)[0, 0]
+            return distrib[0], value[0], action, distrib[0, action]
+
+        def put_task(self, state, callback):
+            output = self.pool.submit(self._predict, state)
+            output.add_done_callback(callback)
 
     def __init__(self, args):
         super(AgentMaster, self).__init__()
@@ -125,42 +120,41 @@ class AgentMaster(Thread):
         self.send_thread.start()
 
         self.queue = queue.Queue(maxsize=args.epoch_size * 5)
-        self.predict_batch = self.PredictBatch(args.predict_batch_size)
         self.score = deque(maxlen=50)
+        self.predictors = self.Predictor(args.predict_batch_size, self.model)
 
         self.log_dir = os.path.join(args.log_dir, f"train-{args.env_name}")
         self.writer = SummaryWriter(self.log_dir)
 
     def run(self) -> None:
         self.clients = defaultdict(self.ClientState)
-
         while True:
             msg = pickle.loads(self.c2s_socket.recv(copy=False))
             ident, state, reward, done = msg
             client = self.clients[ident]
             if client.ident is None:
                 client.ident = ident
-            self.predict_batch.add(client, state)
-            if self.predict_batch.full():
-                # predict the action, put in the send_queue
-                # collect the experience generate the train batch for update model
-                distrib_batch, value_batch = self.predict_batch.predict(model=self.model)
-                for distrib, value, client in zip(distrib_batch, value_batch, self.predict_batch.clients):
-                    action = np.random.choice(self.args.action_size, p=distrib.numpy())
-                    self.send_queue.put([client.ident, pickle.dumps(action)])
-                    if len(client.memory) > 0:
-                        client.memory[-1].reward = reward
-                        if done:
-                            # should clear client's memory and put to queue
-                            self._parse_memory(0, client, True)
-                        else:
-                            if len(client.memory) == self.args.local_time_max + 1:
-                                R = client.memory[-1].value
-                                self._parse_memory(R, client, False)
-                    client.memory.append(
-                        Experience(state=state, action=action, reward=None, value=value[0],
-                                   action_prob=distrib[action]))
-                self.predict_batch.reset()
+            # process message
+            if len(client.memory) > 0:
+                client.memory[-1].reward = reward
+                if done:
+                    # should clear client's memory and put to queue
+                    self._parse_memory(0, client, True)
+                else:
+                    if len(client.memory) == self.args.local_time_max + 1:
+                        R = client.memory[-1].value
+                        self._parse_memory(R, client, False)
+
+            self._collect_experience(state, client)
+
+    def _collect_experience(self, state, client):
+        def cb(ouput):
+            distrib, value, action, action_prob = ouput.result()
+            client.memory.append(
+                Experience(state=state, action=action, reward=None, value=value, action_prob=action_prob))
+            self.send_queue.put([client.ident, pickle.dumps(action.numpy())])
+
+        self.predictors.put_task(state[np.newaxis, :], cb)
 
     def _parse_memory(self, init_r, client, done):
         mem = client.memory
@@ -201,7 +195,8 @@ class AgentMaster(Thread):
     def __train_step(self, data):
         state, action, target_value, action_prob = data
         with tf.GradientTape() as tape:
-            policy, value = self.model(state)
+            logits, value = self.model(state)
+            policy = tf.nn.softmax(logits)
             value = tf.squeeze(value, [1])  # (B,)
             advantage = tf.subtract(target_value, value)  # (B,)
             log_probs = tf.math.log(policy + 1e-6)
@@ -211,7 +206,7 @@ class AgentMaster(Thread):
             policy_loss = -tf.reduce_sum(log_pi_a_given_s * tf.stop_gradient(advantage) * importance)
             entropy_loss = tf.reduce_sum(policy * log_probs)
             value_loss = tf.nn.l2_loss(advantage)
-            loss = tf.add_n([policy_loss, entropy_loss * 0.01, value_loss])
+            loss = tf.add_n([policy_loss, entropy_loss * 0.01, value_loss]) / self.args.batch_size
         grads = tape.gradient(loss, self.model.trainable_variables)
         self.optimizer.apply_gradients(zip(grads, self.model.trainable_variables))
         return loss, policy_loss, value_loss, tf.reduce_mean(advantage)
@@ -240,13 +235,13 @@ if __name__ == '__main__':
 
     parser = argparse.ArgumentParser()
     parser.add_argument('--env_name', '--env', help='env name', default='ALE/Breakout-v5')
-    parser.add_argument('--workers', default=mp.cpu_count())
+    parser.add_argument('--workers', default=mp.cpu_count() // 2)
     parser.add_argument('--frame_history', '--history', default=4)
     parser.add_argument('--render_mode', '--em', help='env mode', default=None)
     parser.add_argument('--url_c2s', help='zmq pipeline url c2s', default='ipc://agent-c2s')
     parser.add_argument('--url_s2c', help='zmq pipeline url s2c', default='ipc://agent-s2c')
     parser.add_argument('--batch_size', default=128)
-    parser.add_argument('--predict_batch_size', default=mp.cpu_count()//2)
+    parser.add_argument('--predict_batch_size', default=mp.cpu_count() // 4)
     parser.add_argument('--epoch_size', default=1000)
     parser.add_argument('--local_time_max', default=5)
     parser.add_argument('--gamma', default=0.99)
