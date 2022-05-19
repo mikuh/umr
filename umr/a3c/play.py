@@ -1,0 +1,27 @@
+import tensorflow as tf
+from umr.utils import get_gym_env
+from umr.a3c.model import A3C
+import numpy as np
+
+env_name = "Breakout-v5"
+
+env = get_gym_env(f"ALE/{env_name}", render_mode="human", is_train=False)
+
+model = A3C(env.action_space.n)
+latest = tf.train.latest_checkpoint(f'./train_log/train-ALE/{env_name}')
+model.load_weights(latest)
+observation = env.reset()
+score = 0
+while True:
+    distrib, _ = model(observation[np.newaxis, :])
+    if np.random.random(1)[0] < 0.01:
+        action = np.random.choice(env.action_space.n, p=distrib.numpy()[0])
+    else:
+        action = np.argmax(distrib.numpy()[0])
+    observation, reward, done, info = env.step(action)
+    score += reward
+    if done:
+        print(score)
+        observation = env.reset()
+        score = 0
+env.close()
