@@ -3,6 +3,7 @@ from tensorboardX import SummaryWriter
 import multiprocessing as mp
 from threading import Thread
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 import pickle
 import zmq
 import queue
@@ -14,23 +15,6 @@ from collections import deque
 import os
 from umr.utils import logger
 from umr.utils import get_gym_env
-
-
-class RateSchedule(tf.keras.optimizers.schedules.LearningRateSchedule):
-    def __init__(self, init_rate, l: list):
-        super(RateSchedule, self).__init__()
-        self.init_rate = init_rate
-        self.l = l
-
-    def __call__(self, step):
-        for i in range(len(self.l)):
-            if step < self.l[i][0]:
-                if i == 0:
-                    return self.init_rate
-                return self.l[i - 1][1]
-        return self.l[-1][1]
-
-
 
 
 class Experience(object):
@@ -87,30 +71,23 @@ class AgentMaster(Thread):
             self.score = 0
             self.steps = 0
 
-    class PredictBatch(object):
-        def __init__(self, max_len, model):
-            self.clients = []
-            self.states = []
-            self.size = 0
-            self.max_size = max_len
+    class Predictor(object):
+
+        def __init__(self, workers, model):
+            self.pool = ThreadPoolExecutor(max_workers=workers)
             self.model = model
 
-        def add(self, client, state):
-            self.clients.append(client)
-            self.states.append(state)
-            self.size += 1
-
-        def reset(self):
-            self.clients = []
-            self.states = []
-            self.size = 0
-
-        def full(self):
-            return self.size == self.max_size
-
         @tf.function
-        def predict(self):
-            return self.model(np.array(self.states))
+        def _predict(self, state):
+            self.model.make_predict_function()
+            logits, value = self.model(state)
+            distrib = tf.nn.softmax(logits)
+            action = tf.random.categorical(logits, 1)[0, 0]
+            return distrib[0], value[0], action, distrib[0, action]
+
+        def put_task(self, state, callback):
+            output = self.pool.submit(self._predict, state)
+            output.add_done_callback(callback)
 
     def __init__(self, args):
         super(AgentMaster, self).__init__()
@@ -118,7 +95,7 @@ class AgentMaster(Thread):
         self.args = args
         self.daemon = True
         self.name = 'Master'
-        self.optimizer = tf.keras.optimizers.Adam(learning_rate=args.lr)
+        self.optimizer = tf.keras.optimizers.Adam(learning_rate=args.lr, epsilon=1e-3)
         # zmq socket
         self.context = zmq.Context()
         # receive the state, reward, done
@@ -131,7 +108,7 @@ class AgentMaster(Thread):
         self.s2c_socket.set_hwm(10)
 
         # queueing messages to client
-        self.send_queue = queue.Queue(maxsize=args.batch_size * 2)
+        self.send_queue = queue.Queue(maxsize=args.batch_size)
         self.args = args
 
         def send_loop():
@@ -144,65 +121,43 @@ class AgentMaster(Thread):
         self.send_thread.start()
 
         self.queue = queue.Queue(maxsize=args.batch_size * args.predict_batch_size)
-        self.predict_batch = self.PredictBatch(args.predict_batch_size, self.model)
         self.score = deque(maxlen=50)
         self.episode_steps = deque(maxlen=50)
         self.episode = 0
+        self.predictors = self.Predictor(args.predict_batch_size, self.model)
+
         self.log_dir = os.path.join(args.log_dir, f"train-{args.env_name}")
         self.writer = SummaryWriter(self.log_dir)
 
     def run(self) -> None:
         self.clients = defaultdict(self.ClientState)
-
         while True:
             msg = pickle.loads(self.c2s_socket.recv(copy=False))
             ident, state, reward, done = msg
             client = self.clients[ident]
             if client.ident is None:
                 client.ident = ident
-            client.score += reward
-            client.steps += 1
-
-            distrib, value = self.model(state[np.newaxis, :])
-            distrib = distrib.numpy()[0]
-            action = np.random.choice(self.args.action_size, p=distrib)
-            self.send_queue.put([client.ident, pickle.dumps(action)])
+            # process message
             if len(client.memory) > 0:
                 client.memory[-1].reward = reward
                 if done:
                     # should clear client's memory and put to queue
                     self._parse_memory(0, client, True)
-                    self.episode += 1
                 else:
                     if len(client.memory) == self.args.local_time_max + 1:
                         R = client.memory[-1].value
                         self._parse_memory(R, client, False)
 
-            client.memory.append(Experience(state=state, action=action, reward=None, value=value[0],
-                                            action_prob=distrib[action]))
-            # self.predict_batch.add(client, state)
-            # if self.predict_batch.full():
-            #     # predict the action, put in the send_queue
-            #     # collect the experience generate the train batch for update model
-            #     distrib_batch, value_batch = self.predict_batch.predict()
-            #     for distrib, value, client in zip(distrib_batch, value_batch, self.predict_batch.clients):
-            #         action = np.random.choice(self.args.action_size, p=distrib.numpy())
-            #         self.send_queue.put([client.ident, pickle.dumps(action)])
-            #         if len(client.memory) > 0:
-            #             client.memory[-1].reward = reward
-            #             if done:
-            #                 # should clear client's memory and put to queue
-            #                 self._parse_memory(0, client, True)
-            #                 self.episode += 1
-            #             else:
-            #                 if len(client.memory) == self.args.local_time_max + 1:
-            #                     R = client.memory[-1].value
-            #                     self._parse_memory(R, client, False)
-            #
-            #         client.memory.append(Experience(state=state, action=action, reward=None, value=value[0],
-            #                                         action_prob=distrib[action]))
-            #
-            #     self.predict_batch.reset()
+            self._collect_experience(state, client)
+
+    def _collect_experience(self, state, client):
+        def cb(ouput):
+            distrib, value, action, action_prob = ouput.result()
+            client.memory.append(
+                Experience(state=state, action=action, reward=None, value=value, action_prob=action_prob))
+            self.send_queue.put([client.ident, pickle.dumps(action.numpy())])
+
+        self.predictors.put_task(state[np.newaxis, :], cb)
 
     def _parse_memory(self, init_r, client, done):
         mem = client.memory
@@ -213,6 +168,7 @@ class AgentMaster(Thread):
         mem.reverse()
         R = float(init_r)
         for k in mem:
+            client.score += k.reward
             R = np.clip(k.reward, -1, 1) + self.args.gamma * R
             # advantage = R - k.value
             self.queue.put([k.state, k.action, R, k.action_prob])
@@ -238,13 +194,14 @@ class AgentMaster(Thread):
                                                                 tf.TensorSpec(shape=(), dtype=tf.float32),
                                                                 tf.TensorSpec(shape=(), dtype=tf.float32),
                                                                 )).batch(
-            self.args.batch_size) #.prefetch(tf.data.AUTOTUNE)  # .cache().prefetch(tf.data.AUTOTUNE)
+            self.args.batch_size).prefetch(self.args.batch_size)  # .cache().prefetch(tf.data.AUTOTUNE)
 
     @tf.function
     def __train_step(self, data):
         state, action, target_value, action_prob = data
         with tf.GradientTape() as tape:
-            policy, value = self.model(state)
+            logits, value = self.model(state)
+            policy = tf.nn.softmax(logits)
             value = tf.squeeze(value, [1])  # (B,)
             advantage = tf.subtract(target_value, tf.stop_gradient(value))
             log_probs = tf.math.log(policy + 1e-6)
@@ -295,7 +252,7 @@ if __name__ == '__main__':
     parser.add_argument('--url_c2s', help='zmq pipeline url c2s', default='ipc://agent-c2s')
     parser.add_argument('--url_s2c', help='zmq pipeline url s2c', default='ipc://agent-s2c')
     parser.add_argument('--batch_size', default=128)
-    parser.add_argument('--predict_batch_size', default=mp.cpu_count())
+    parser.add_argument('--predict_batch_size', default=16)
     parser.add_argument('--epoch_size', default=1000)
     parser.add_argument('--local_time_max', default=5)
     parser.add_argument('--gamma', default=0.99)
