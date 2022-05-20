@@ -169,6 +169,7 @@ class AgentMaster(Thread):
         R = float(init_r)
         for k in mem:
             client.score += k.reward
+            client.steps += 1
             R = np.clip(k.reward, -1, 1) + self.args.gamma * R
             # advantage = R - k.value
             self.queue.put([k.state, k.action, R, k.action_prob])
@@ -178,6 +179,7 @@ class AgentMaster(Thread):
         else:
             self.score.append(client.score)
             self.episode_steps.append(client.steps)
+            self.episode += 1
             client.memory = []
             client.score = 0
             client.steps = 0
@@ -219,12 +221,13 @@ class AgentMaster(Thread):
 
     def learn(self):
         dataset = self.get_training_dataflow()
-        iterator = iter(dataset)
         step = 0
+        best_score = 0
         for epoch in range(1, 600):
             for data in tqdm(dataset.take(self.args.epoch_size), total=self.args.epoch_size, desc=f"Epoch {epoch}"):
                 step += 1
-                loss, policy_loss, value_loss, advantage, importance, entropy_loss, value = self.__train_step(data, epoch)
+                loss, policy_loss, value_loss, advantage, importance, entropy_loss, value = self.__train_step(data,
+                                                                                                              epoch)
             mean_score = np.mean(self.score)
             max_score = max(self.score)
             logger.info(f"EPOCH:{epoch}, Mean Score: {mean_score}, Max Score: {max_score}")
@@ -234,12 +237,13 @@ class AgentMaster(Thread):
             self.writer.add_scalar('train/advantage', advantage.numpy(), step)
             self.writer.add_scalar('train/importance', importance.numpy(), step)
             self.writer.add_scalar('train/entropy_loss', entropy_loss.numpy(), step)
-            self.writer.add_scalar('train/entropy_loss', entropy_loss.numpy(), step)
             self.writer.add_scalar('client/mean_score', mean_score, step)
             self.writer.add_scalar('client/max_score', max_score, step)
             self.writer.add_scalar('client/episode_steps', np.mean(self.episode_steps), self.episode)
             self.writer.add_scalar('client/queue_length', self.queue.qsize(), step)
-            self.model.save_weights(os.path.join(self.log_dir, 'checkpoints'))
+            if mean_score > best_score:
+                self.model.save_weights(os.path.join(self.log_dir, 'checkpoints'))
+                best_score = mean_score
 
 
 def get_beta(epoch):
@@ -249,6 +253,8 @@ def get_beta(epoch):
         return 0.001
     elif epoch < 90:
         return 0.0005
+    elif epoch < 120:
+        return 0.0002
     else:
         return 0.0001
 
@@ -258,13 +264,13 @@ if __name__ == '__main__':
 
     parser = argparse.ArgumentParser()
     parser.add_argument('--env_name', '--env', help='env name', default='ALE/Breakout-v5')
-    parser.add_argument('--workers', default=mp.cpu_count()*2)
+    parser.add_argument('--workers', default=mp.cpu_count())
     parser.add_argument('--frame_history', '--history', default=4)
     parser.add_argument('--render_mode', '--em', help='env mode', default=None)
     parser.add_argument('--url_c2s', help='zmq pipeline url c2s', default='ipc://agent-c2s')
     parser.add_argument('--url_s2c', help='zmq pipeline url s2c', default='ipc://agent-s2c')
     parser.add_argument('--batch_size', default=128)
-    parser.add_argument('--predict_batch_size', default=16)
+    parser.add_argument('--predict_batch_size', default=8)
     parser.add_argument('--epoch_size', default=1000)
     parser.add_argument('--local_time_max', default=5)
     parser.add_argument('--gamma', default=0.99)
