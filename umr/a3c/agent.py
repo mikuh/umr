@@ -148,8 +148,8 @@ class AgentMaster(Thread):
             self._collect_experience(state, client)
 
     def _collect_experience(self, state, client):
-        def cb(ouput):
-            distrib, value, action, action_prob = ouput.result()
+        def cb(output):
+            distrib, value, action, action_prob = output.result()
             client.memory.append(
                 Experience(state=state, action=action, reward=None, value=value, action_prob=action_prob))
             self.send_queue.put([client.ident, pickle.dumps(action.numpy())])
