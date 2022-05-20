@@ -1,15 +1,13 @@
 import gym
 import cv2
+import numpy as np
 from umr.atari_wrapper import FireResetEnv, MapState, FrameStack, LimitLength
 
 
 def get_gym_env(env_name: str, is_train: bool = True, image_size: tuple = (84, 84), render_mode=None) -> gym.Env:
-    if render_mode is None:
-        env = gym.make(env_name)
-    else:
-        env = gym.make(env_name, render_mode=render_mode)
+    env = gym.make(env_name, render_mode=render_mode)
     env = FireResetEnv(env)
-    env = MapState(env, lambda im: cv2.resize(im, image_size))
+    env = MapState(env, lambda im: cv2.resize(im, image_size).astype(np.float32)/255.0)
     env = FrameStack(env, 4)
     if is_train:
         env = LimitLength(env, 60000)
