@@ -89,6 +89,37 @@ class AgentMaster(Thread):
             output = self.pool.submit(self._predict, state)
             output.add_done_callback(callback)
 
+    class Trainer(object):
+
+        def __init__(self, workers, model):
+            self.pool = ThreadPoolExecutor(max_workers=workers)
+            self.model = model
+
+        @tf.function
+        def _train_step(self, data, epoch):
+            state, action, target_value, action_prob = data
+            with tf.GradientTape() as tape:
+                logits, value = self.model(state)
+                policy = tf.nn.softmax(logits)
+                value = tf.squeeze(value, [1])  # (B,)
+                advantage = tf.subtract(target_value, tf.stop_gradient(value))
+                log_probs = tf.math.log(policy + 1e-6)
+                log_pi_a_given_s = tf.reduce_sum(log_probs * tf.one_hot(action, self.args.action_size), 1)  # (B,)
+                pi_a_given_s = tf.reduce_sum(policy * tf.one_hot(action, self.args.action_size), 1)
+                importance = tf.stop_gradient(tf.clip_by_value(pi_a_given_s / (action_prob + 1e-8), 0, 10))
+                policy_loss = -tf.reduce_mean(log_pi_a_given_s * advantage * importance)
+                entropy_loss = tf.reduce_mean(policy * log_probs) * get_beta(epoch)
+                value_loss = tf.nn.l2_loss(value - target_value) / self.args.batch_size
+                loss = tf.add_n([policy_loss, entropy_loss, value_loss])
+            grads = tape.gradient(loss, self.model.trainable_variables)
+            self.optimizer.apply_gradients(zip(grads, self.model.trainable_variables))
+            return loss, policy_loss, value_loss, tf.reduce_mean(advantage), tf.reduce_mean(importance), \
+                   entropy_loss, tf.reduce_mean(value)
+
+        def train(self, data, epoch):
+            output = self.pool.submit(self._train_step, data, epoch)
+            return output
+
     def __init__(self, args):
         super(AgentMaster, self).__init__()
         self.model = A3C(args.action_size)
@@ -120,11 +151,12 @@ class AgentMaster(Thread):
         self.send_thread.setDaemon(True)
         self.send_thread.start()
 
-        self.queue = queue.Queue(maxsize=args.batch_size * args.predict_batch_size)
+        self.queue = queue.Queue(maxsize=args.batch_size * args.predict_thread)
         self.score = deque(maxlen=50)
         self.episode_steps = deque(maxlen=50)
         self.episode = 0
-        self.predictors = self.Predictor(args.predict_batch_size, self.model)
+        self.predictors = self.Predictor(args.predict_thread, self.model)
+        self.trainer = self.Trainer(args.train_thread, self.model)
 
         self.log_dir = os.path.join(args.log_dir, f"train-{args.env_name}")
         self.writer = SummaryWriter(self.log_dir)
@@ -245,6 +277,32 @@ class AgentMaster(Thread):
                 self.model.save_weights(os.path.join(self.log_dir, 'checkpoints'))
                 best_score = mean_score
 
+    def learn2(self):
+        dataset = self.get_training_dataflow()
+        step = 0
+        best_score = 0
+        for epoch in range(1, 600):
+            for data in tqdm(dataset.take(self.args.epoch_size), total=self.args.epoch_size, desc=f"Epoch {epoch}"):
+                step += 1
+                output = self.trainer.train(data, epoch)
+            loss, policy_loss, value_loss, advantage, importance, entropy_loss, value = output.result()
+            mean_score = np.mean(self.score)
+            max_score = max(self.score)
+            logger.info(f"E:{epoch}, Mean Score: {mean_score}, Max Score: {max_score}")
+            self.writer.add_scalar('train/loss', loss.numpy(), step)
+            self.writer.add_scalar('train/policy_loss', policy_loss.numpy(), step)
+            self.writer.add_scalar('train/value_loss', value_loss.numpy(), step)
+            self.writer.add_scalar('train/advantage', advantage.numpy(), step)
+            self.writer.add_scalar('train/importance', importance.numpy(), step)
+            self.writer.add_scalar('train/entropy_loss', entropy_loss.numpy(), step)
+            self.writer.add_scalar('client/mean_score', mean_score, step)
+            self.writer.add_scalar('client/max_score', max_score, step)
+            self.writer.add_scalar('client/episode_steps', np.mean(self.episode_steps), self.episode)
+            self.writer.add_scalar('client/queue_length', self.queue.qsize(), step)
+            if mean_score > best_score:
+                self.model.save_weights(os.path.join(self.log_dir, 'checkpoints'))
+                self.best_score = mean_score
+
 
 def get_beta(epoch):
     if epoch < 30:
@@ -270,7 +328,8 @@ if __name__ == '__main__':
     parser.add_argument('--url_c2s', help='zmq pipeline url c2s', default='ipc://agent-c2s')
     parser.add_argument('--url_s2c', help='zmq pipeline url s2c', default='ipc://agent-s2c')
     parser.add_argument('--batch_size', default=128)
-    parser.add_argument('--predict_batch_size', default=8)
+    parser.add_argument('--predict_thread', default=8)
+    parser.add_argument('--train_thread', default=2)
     parser.add_argument('--epoch_size', default=1000)
     parser.add_argument('--local_time_max', default=5)
     parser.add_argument('--gamma', default=0.99)
@@ -285,4 +344,4 @@ if __name__ == '__main__':
     [w.start() for w in workers]
     master = AgentMaster(args)
     master.start()
-    master.learn()
+    master.learn2()
