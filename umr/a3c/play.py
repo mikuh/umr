@@ -5,7 +5,7 @@ import numpy as np
 
 env_name = "Breakout-v5"
 
-env = get_gym_env(f"ALE/{env_name}", render_mode=None, is_train=False)
+env = get_gym_env(f"ALE/{env_name}", render_mode="human", is_train=False)
 
 model = A3C(env.action_space.n)
 latest = tf.train.latest_checkpoint(f'./train_log/train-ALE/{env_name}')
@@ -22,7 +22,6 @@ for _ in range(50):
         else:
             action = np.argmax(distrib.numpy()[0])
         observation, reward, done, info = env.step(action)
-        # env.render("human")
         score += reward
         if done:
             print(score)
