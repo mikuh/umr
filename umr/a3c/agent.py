@@ -246,18 +246,11 @@ class AgentMaster(Thread):
                 best_score = mean_score
 
 
-
 def get_beta(epoch):
-    if epoch < 30:
-        return 0.002
-    elif epoch < 60:
-        return 0.001
-    elif epoch < 90:
-        return 0.0005
-    elif epoch < 120:
-        return 0.0002
+    if epoch < 200:
+        return 0.005
     else:
-        return 0.0001
+        return 0.002
 
 
 if __name__ == '__main__':
@@ -271,7 +264,7 @@ if __name__ == '__main__':
     parser.add_argument('--url_c2s', help='zmq pipeline url c2s', default='ipc://agent-c2s')
     parser.add_argument('--url_s2c', help='zmq pipeline url s2c', default='ipc://agent-s2c')
     parser.add_argument('--batch_size', default=128)
-    parser.add_argument('--predict_thread', default=4)
+    parser.add_argument('--predict_thread', default=8)
     parser.add_argument('--epoch_size', default=1000)
     parser.add_argument('--local_time_max', default=5)
     parser.add_argument('--gamma', default=0.99)
