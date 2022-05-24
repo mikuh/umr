@@ -1,42 +1,36 @@
 import tensorflow as tf
 import ray
+import copy
 import numpy as np
+import argparse
 from collections import deque
 from umr.ppo.model import create_model
 from umr.utils import get_gym_env
+from umr.utils import logger
 
 ray.init()
 
 
-class RolloutInstance(object):
+class Experience(object):
 
-    def __init__(self, max_size, gamma, lamda, gae_normal=True):
-        self.max_size = max_size
-        self.gae_normal = gae_normal
-        self.gamma = gamma
-        self.lamda = lamda
-        self.states = []
-        self.actions = []
-        self.rewards = []
-        self.probs = []
-        self.values = []
-        self.dones = []
+    def __init__(self, state, action, reward, **kwargs):
+        self.state = state
+        self.action = action
+        self.reward = reward
+        for k, v in kwargs.items():
+            setattr(self, k, v)
 
-    def add(self, state, action, reward, prob, value, done):
-        self.states.append(state)
-        self.actions.append(action)
-        self.rewards.append(reward)
-        self.probs.append(prob)
-        self.values.append(value)
-        self.dones.append(done)
+
+class ClientMemory(object):
+
+    def __init__(self, args):
+        self.gae_normal = args.gae_normal
+        self.gamma = args.gamma
+        self.lamda = args.lamda
+        self.experiences = []
 
     def reset(self):
-        self.states = [self.states[-1]]
-        self.actions = [self.actions[-1]]
-        self.rewards = [self.rewards[-1]]
-        self.probs = [self.probs[-1]]
-        self.values = [self.values[-1]]
-        self.dones = [self.dones[-1]]
+        self.experiences = self.experiences[-1]
 
     def parse_instance(self):
         states = self.states[:-1]
@@ -57,6 +51,37 @@ class RolloutInstance(object):
         self.reset()
         return dict(state=states, action=actions, prob=probs, gae=gaes.tolist(), target=targets.tolist(),
                     done=dones)
+
+    def parse_memory(self):
+        R = self.experiences[-1].value
+        experiences = self.experiences
+        if not self.experiences[-1].done:
+            last = self.experiences[-1]
+            experiences = self.experiences[:-1]
+        else:
+            R = 0
+        experiences.reverse()
+        for e in experiences:
+            R = np.clip(e.reward, -1, 1) + self.args.gamma * R
+            adv = R - e.value
+
+
+@ray.remote
+class ReplyBuffer(object):
+
+    def __int__(self):
+        self.experiences = []
+
+    def store(self, state, action, pi_old, gae, target):
+        self.experiences.append((state, action, pi_old, gae, target))
+
+    def sampling(self):
+        sample_range = np.arange(len(self.action))
+        np.random.shuffle(sample_range)
+        sample_idx = sample_range[:self.args.batch_size]
+
+    def clear(self):
+        pass
 
 
 @ray.remote
@@ -80,9 +105,10 @@ class ClientRecord(object):
 @ray.remote
 class RolloutWorker(object):
 
-    def __init__(self):
-        self.env = get_gym_env("ALE/Breakout-v5")
+    def __init__(self, args):
+        self.env = get_gym_env(args.env_name)  # "ALE/Breakout-v5"
         self.model = create_model(self.env.action_space.n)
+        self.memory = ClientMemory(args)
         self.state = self.env.reset()
         self.rollout = 5
         self.score = 0
@@ -97,14 +123,18 @@ class RolloutWorker(object):
         self.model.set_weights(w)
 
     def run_env(self):
-        for _ in range(self.rollout):
+        while len(self.memory.experiences) < self.rollout + 1:
             action, distribute, value = self.predict(self.state[np.newaxis, :])
             next_state, reward, done, _ = self.step(action.numpy())
             self.score += reward
             if done:
-                next_state = self.reset()
+                self.state = self.reset()
                 self.score = 0
+                return
+            self.memory.experiences.append(
+                Experience(state=self.state, action=action, reward=reward, action_prob=distribute, value=value))
             self.state = next_state
+        return
 
     @tf.function
     def predict(self, state):
@@ -114,6 +144,18 @@ class RolloutWorker(object):
         return action, distrib[0], value[0, 0]
 
 
-workers = [RolloutWorker.remote() for _ in range(4)]
-
+# workers = [RolloutWorker.remote() for _ in range(4)]
+#
 # print(ray.get(results))
+# def gen():
+#     for a, b in [[[1, 2, 3], 2], [[3, 4, 5], 4], [[5, 6, 7], 6]]:
+#         yield a, b
+
+#
+# dataset = tf.data.Dataset.from_generator(gen, output_signature=(tf.TensorSpec(shape=(3,), dtype=tf.int32),
+#                                                                 tf.TensorSpec(shape=(), dtype=tf.int32)))
+# print(list(dataset.take(1)))
+
+
+dataset = tf.data.Dataset.from_slices([[[1, 2, 3], 2], [[3, 4, 5], 4], [[5, 6, 7], 6]])
+print(list(dataset.as_numpy_iterator()))
