@@ -3,8 +3,11 @@ import ray
 import copy
 import os
 import numpy as np
+import zmq
+import pickle
 import multiprocessing as mp
 import argparse
+from threading import Thread
 from tqdm import tqdm
 from tensorboardX import SummaryWriter
 from collections import deque
@@ -153,12 +156,16 @@ class AgentWorker(object):
 
     def __init__(self, args):
         self.env = get_gym_env(args.env_name)  # "ALE/Breakout-v5"
-        self.model = create_model(self.env.action_space.n)
         self.memory = self.ClientMemory(args)
         self.state = self.env.reset()
         self.rollout = args.rollout
         self.score = 0
         self.steps = 0
+
+        # zmq socket
+        self.context = zmq.Context()
+        self.socket = self.context.socket(zmq.REQ)
+        self.socket.connect(args.url)
 
     def reset(self):
         self.score = 0
@@ -176,13 +183,12 @@ class AgentWorker(object):
 
     def run_env(self, replay_buffer):
         while len(self.memory.experiences) < self.rollout + 1:
-            # for _ in range(self.rollout + 1):
-            action, distribute, value = self.predict(self.state[np.newaxis, :])
-            next_state, reward, done, _ = self.step(action.numpy())
+            self.socket.send(pickle.dumps(self.state[np.newaxis, :]))
+            action, distribute, value = pickle.loads(self.socket.recv())
+            next_state, reward, done, _ = self.step(action)
             self.memory.add_experience(
-                Experience(state=self.state, action=action.numpy(), reward=reward, action_prob=distribute.numpy(),
-                           value=value.numpy(),
-                           done=done))
+                Experience(state=self.state, action=action, reward=reward, action_prob=distribute,
+                           value=value, done=done))
             if done:
                 replay_buffer.add_client_record.remote(self.score, self.steps)
                 self.state = self.reset()
@@ -191,24 +197,35 @@ class AgentWorker(object):
             self.state = next_state
         self.memory.parse_memory(replay_buffer)
 
-    @tf.function
-    def predict(self, state):
-        logits, value = self.model(state)
-        distrib = tf.nn.softmax(logits)
-        action = tf.random.categorical(logits, 1)[0, 0]
-        return action, distrib[0], value[0, 0]
 
 
 class AgentMaster(object):
 
     def __init__(self, args):
-        self.workers = [AgentWorker.remote(args) for i in range(args.workers)]
+        self.workers = [AgentWorker.remote(args) for _ in range(args.workers)]
         self.replay_buffer = ReplyBuffer.remote()
         self.model = create_model(action_size=args.action_size)
         self.opt = tf.keras.optimizers.Adam(learning_rate=args.lr)
         self.log_dir = os.path.join(args.log_dir, f"train-{args.env_name}")
         self.writer = SummaryWriter(self.log_dir)
         self.args = args
+
+        self.context = zmq.Context()
+        self.poller = zmq.Poller()
+        self.socket = self.context.socket(zmq.ROUTER)
+        self.socket.bind(self.args.url)
+        self.poller.register(self.socket, zmq.POLLIN)
+
+        def predict_loop():
+            while True:
+                msg = self.socket.recv_multipart()
+                action, distrib, value = self.predict(pickle.loads(msg[2]))
+                msg[2] = pickle.dumps([action.numpy(), distrib.numpy(), value.numpy()])
+                self.socket.send_multipart(msg)
+
+        self.predict_thread = Thread(target=predict_loop)
+        self.predict_thread.daemon = True
+        self.predict_thread.start()
 
     @tf.function
     def train_step(self, state, action, pi_old, adv, target):
@@ -234,20 +251,27 @@ class AgentMaster(object):
         return loss, pi_loss, value_loss, entropy_loss, tf.reduce_mean(adv), tf.reduce_mean(value), tf.reduce_mean(
             clipped_ratio)
 
+    @tf.function
+    def predict(self, state):
+        logits, value = self.model(state)
+        distrib = tf.nn.softmax(logits)
+        action = tf.random.categorical(logits, 1)[0, 0]
+        return action, distrib[0], value[0, 0]
+
     def learn(self):
         step = 0
+
         for epoch in range(1, 600):
             for _ in tqdm(range(self.args.epoch_size), total=self.args.epoch_size):
                 step += 1
                 ray.get([w.run_env.remote(self.replay_buffer) for w in self.workers])
-                _state, _action, _pi_old, _adv, _target = ray.get(self.replay_buffer.sampling.remote())
+                sampling = self.replay_buffer.sampling.remote()
+                _state, _action, _pi_old, _adv, _target = ray.get(sampling)
                 for _ in range(self.args.n_update):
                     state, action, pi_old, adv, target = self.batch(_state, _action, _pi_old, _adv, _target)
                     loss, pi_loss, value_loss, entropy, adv, value, clipped_ratio = self.train_step(state, action,
                                                                                                     pi_old,
                                                                                                     adv, target)
-                weights = self.model.get_weights()
-                ray.get([w.update_weights.remote(weights) for w in self.workers])
 
             self.writer.add_scalar("train/loss", loss.numpy(), step)
             self.writer.add_scalar('train/policy_loss', pi_loss.numpy(), step)
@@ -274,7 +298,7 @@ parser.add_argument('--workers', default=mp.cpu_count())
 parser.add_argument('--gae_normal', default=True)
 parser.add_argument('--gamma', default=0.99)
 parser.add_argument('--lamda', default=0.95)
-parser.add_argument('--n_update', default=5)
+parser.add_argument('--n_update', default=4)
 parser.add_argument('--lr', default=tf.keras.optimizers.schedules.ExponentialDecay(0.001, decay_steps=10000,
                                                                                    decay_rate=0.95, staircase=True))
 parser.add_argument('--batch_size', default=128)

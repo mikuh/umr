@@ -97,15 +97,13 @@ class Worker(object):
         # zmq socket
         self.context = zmq.Context()
         self.socket = self.context.socket(zmq.REQ)
-        self.socket.setsockopt(zmq.IDENTITY, self.identity)
         self.socket.connect(self.args.url)
 
     def rollout(self, record):
         for _ in range(self.rollout + 1):
-            self.socket.send(pickle.dumps((self.identity, self.state)), copy=False)
-
-            msg = self.socket.recv_multipart(copy=False)
-            action, action_prob, value = pickle.loads(msg[1])
+            self.socket.send(pickle.dumps(self.state), copy=False)
+            msg = self.socket.recv(copy=False)
+            action, action_prob, value = pickle.loads(msg)
             next_state, reward, done, _ = self.env.step(action)
             self.score += reward
             self.instance.add(self.state, action, np.clip(reward, -1, 1), action_prob, value, done)
@@ -129,16 +127,26 @@ class Agent(object):
         self.args = args
         self.episodes = 0
         self.record = Record.remote()
+        # zmq
         self.context = zmq.Context()
-        self.socket = self.context.socket(zmq.REP)
+        self.poller = zmq.Poller()
+        self.socket = self.context.socket(zmq.ROUTER)
         self.socket.bind(args.url)
+        self.poller.register(self.socket, zmq.POLLIN)
 
         def predict_loop():
             while True:
-                ident, state = pickle.loads(self.socket.recv(copy=False))
-                a, d, v = self.predict(state[np.newaxis, :])
-                msg = [ident, pickle.dumps([a.numpy(), d.numpy(), v.numpy()])]
-                self.socket.send_multipart(msg, copy=False)
+                states = []
+                msgs = []
+                for _ in range(args.workers):
+                    msg = self.socket.recv_multipart(copy=False)
+                    states.append(pickle.loads(msg[2]))
+                    msgs.append(msg)
+                distrib, value = self.batch_predict(np.asarray(states))
+                for msg, d, v in zip(msgs, distrib.numpy(), value.numpy()):
+                    a = np.random.choice(self.args.action_size, p=d)
+                    msg[2] = pickle.dumps([a, d, v])
+                    self.socket.send_multipart(msg, copy=False)
 
         self.predit_thread = Thread(target=predict_loop)
         self.predit_thread.daemon = True
@@ -150,7 +158,8 @@ class Agent(object):
             logits, value = self.model(state)
             pi = tf.nn.softmax(logits)
             value = tf.squeeze(value, [1])
-            entropy_loss = tf.reduce_mean(pi * tf.math.log(pi + 1e-8)) * 0.01
+            # value = tf.clip_by_value(value, clip_value_min=0, clip_value_max=10)
+            entropy_loss = tf.reduce_mean(pi * tf.math.log(pi + 1e-8)) * self.args.entropy_coeff
             onehot_action = tf.one_hot(action, self.args.action_size)  # (B, action_size)
 
             action_prob = tf.reduce_sum(pi * onehot_action, axis=1)
@@ -175,13 +184,19 @@ class Agent(object):
         action = tf.random.categorical(logits, 1)[0, 0]
         return action, distrib[0], value[0, 0]
 
+    @tf.function
+    def batch_predict(self, state):
+        logits, value = self.model(state)
+        distrib = tf.nn.softmax(logits)
+        return distrib, value
+
     def learn(self):
         step = 0
         for epoch in range(1, 600):
             for _ in tqdm(range(self.args.epoch_size), total=self.args.epoch_size):
                 step += 1
                 _state, _action, _pi_old, _adv, _target = self.get_train_data()
-                for _ in range(4):
+                for _ in range(self.args.num_sgd_iter):
                     sample_range = np.arange(len(_action))
                     np.random.shuffle(sample_range)
                     sample_idx = sample_range[:self.args.batch_size]
@@ -224,15 +239,17 @@ class Agent(object):
 parser = argparse.ArgumentParser()
 parser.add_argument('--env_name', '--env', help='env name', default='ALE/Breakout-v5')
 parser.add_argument('--render_mode', '--em', help='env mode', default=None)
-parser.add_argument('--workers', default=mp.cpu_count())
-parser.add_argument('--rollout', default=8)
+parser.add_argument('--workers', default=mp.cpu_count()*2)
+parser.add_argument('--rollout', default=100)
 parser.add_argument('--gae_normal', default=True)
 parser.add_argument('--gamma', default=0.99)
 parser.add_argument('--lamda', default=0.95)
-parser.add_argument('--predict_thread', default=8)
 parser.add_argument('--lr', default=tf.keras.optimizers.schedules.ExponentialDecay(0.001, decay_steps=10000,
-                                                                                   decay_rate=0.95, staircase=True))
-parser.add_argument('--batch_size', default=128)
+                                                                                  decay_rate=0.95, staircase=True))
+
+parser.add_argument('--num_sgd_iter', default=10)
+parser.add_argument('--entropy_coeff', default=0.005)
+parser.add_argument('--batch_size', default=512)
 parser.add_argument('--epoch_size', default=1000)
 parser.add_argument('--ppo_eps', default=0.2)
 parser.add_argument('--frame_history', '--history', default=4)
@@ -241,7 +258,6 @@ parser.add_argument('--url', help='zmq pipeline url', default='ipc://agent-pipli
 parser.add_argument('--log_dir', default='train_log')
 args = parser.parse_args()
 args.action_size = get_gym_env(args.env_name).action_space.n
-
 ray.init()
 agent = Agent(args)
 agent.learn()

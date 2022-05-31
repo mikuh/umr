@@ -3,7 +3,7 @@ from tensorboardX import SummaryWriter
 import multiprocessing as mp
 from threading import Thread
 from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, Future
 import pickle
 import zmq
 import queue
@@ -25,6 +25,78 @@ class Experience(object):
         self.reward = reward
         for k, v in kwargs.items():
             setattr(self, k, v)
+
+
+class PredictorWorkerThread(Thread):
+    def __init__(self, queue, pred_func, id, batch_size=5):
+        super(PredictorWorkerThread, self).__init__()
+        self.name = "PredictorWorkerThread-{}".format(id)
+        self.queue = queue
+        self.func = pred_func
+        self.daemon = True
+        self.batch_size = batch_size
+        self.id = id
+
+    def run(self):
+        while True:
+            batched, futures = self.fetch_batch()
+            try:
+                outputs = self.func(batched)
+            except tf.errors.CancelledError:
+                for f in futures:
+                    f.cancel()
+                logger.warn("In PredictorWorkerThread id={}, call was cancelled.".format(self.id))
+                return
+            for distrib, value, action, f in zip(outputs[0].numpy(), outputs[1].numpy(), outputs[2].numpy(), futures):
+                f.set_result((distrib, value[0], action[0], distrib[action[0]]))
+
+    def fetch_batch(self):
+        """ Fetch a batch of data without waiting"""
+        input, f = self.queue.get()  # data, feature
+        batched, futures = [], []
+        batched.append(input)
+        futures.append(f)
+        while len(futures) < self.batch_size:
+            try:
+                input, f = self.queue.get_nowait()
+                batched.append(input)
+                futures.append(f)
+            except queue.Empty:
+                # pass  # wait
+                break   # do not wait
+        return np.asarray(batched), futures
+
+
+class MultiThreadAsyncPredictor(object):
+
+    def __init__(self, model, batch_size=5, predict_thread=4):
+        """
+        Args:
+            predictors (list): a list of OnlinePredictor available to use.
+            batch_size (int): the maximum of an internal batch.
+        """
+        self.model = model
+        self.input_queue = queue.Queue(maxsize=predict_thread * 128)
+        self.threads = [PredictorWorkerThread(self.input_queue, self._predict, id, batch_size=batch_size) for id in range(predict_thread)]
+
+    @tf.function
+    def _predict(self, state):
+        logits, value = self.model(state)
+        distrib = tf.nn.softmax(logits)
+        action = tf.random.categorical(logits, 1)
+        return distrib, value, action
+
+    def start(self):
+        for t in self.threads:
+            t.start()
+
+    def put_task(self, dp, callback=None):
+        f = Future()
+        if callback is not None:
+            f.add_done_callback(callback)
+        self.input_queue.put((dp, f))
+        return f
+
 
 
 class AgentWorker(mp.Process):
@@ -71,27 +143,11 @@ class AgentMaster(Thread):
             self.score = 0
             self.steps = 0
 
-    class Predictor(object):
-
-        def __init__(self, workers, model):
-            self.pool = ThreadPoolExecutor(max_workers=workers)
-            self.model = model
-
-        @tf.function
-        def _predict(self, state):
-            # self.model.make_predict_function()
-            logits, value = self.model(state)
-            distrib = tf.nn.softmax(logits)
-            action = tf.random.categorical(logits, 1)[0, 0]
-            return distrib[0], value[0], action, distrib[0, action]
-
-        def put_task(self, state, callback):
-            output = self.pool.submit(self._predict, state)
-            output.add_done_callback(callback)
-
     def __init__(self, args):
         super(AgentMaster, self).__init__()
         self.model = A3C(args.action_size)
+        # latest = tf.train.latest_checkpoint(f'./train_log/train-ALE/{args.env_name.split("/")[1]}')
+        # self.model.load_weights(latest)
         self.args = args
         self.daemon = True
         self.name = 'Master'
@@ -120,11 +176,13 @@ class AgentMaster(Thread):
         self.send_thread.setDaemon(True)
         self.send_thread.start()
 
-        self.queue = queue.Queue(maxsize=args.batch_size * args.predict_thread)
+        self.queue = queue.Queue(maxsize=args.batch_size * args.predict_batch)
         self.score = deque(maxlen=50)
         self.episode_steps = deque(maxlen=50)
         self.episode = 0
-        self.predictors = self.Predictor(args.predict_thread, self.model)
+
+        self.predictors = MultiThreadAsyncPredictor(self.model, batch_size=args.predict_batch, predict_thread=args.predict_thread)
+        self.predictors.start()
 
         self.log_dir = os.path.join(args.log_dir, f"train-{args.env_name}")
         self.writer = SummaryWriter(self.log_dir)
@@ -155,9 +213,9 @@ class AgentMaster(Thread):
             distrib, value, action, action_prob = output.result()
             client.memory.append(
                 Experience(state=state, action=action, reward=None, value=value, action_prob=action_prob))
-            self.send_queue.put([client.ident, pickle.dumps(action.numpy())])
+            self.send_queue.put([client.ident, pickle.dumps(action)])
 
-        self.predictors.put_task(state[np.newaxis, :], cb)
+        self.predictors.put_task(state, cb)
 
     def _parse_memory(self, init_r, client, done):
         mem = client.memory
@@ -258,13 +316,14 @@ if __name__ == '__main__':
 
     parser = argparse.ArgumentParser()
     parser.add_argument('--env_name', '--env', help='env name', default='ALE/Breakout-v5')
-    parser.add_argument('--workers', default=mp.cpu_count())
+    parser.add_argument('--workers', default=mp.cpu_count()*2)
     parser.add_argument('--frame_history', '--history', default=4)
     parser.add_argument('--render_mode', '--em', help='env mode', default=None)
     parser.add_argument('--url_c2s', help='zmq pipeline url c2s', default='ipc://agent-c2s')
     parser.add_argument('--url_s2c', help='zmq pipeline url s2c', default='ipc://agent-s2c')
     parser.add_argument('--batch_size', default=128)
-    parser.add_argument('--predict_thread', default=8)
+    parser.add_argument('--predict_thread', default=2)
+    parser.add_argument('--predict_batch', default=16)
     parser.add_argument('--epoch_size', default=1000)
     parser.add_argument('--local_time_max', default=5)
     parser.add_argument('--gamma', default=0.99)
@@ -273,6 +332,7 @@ if __name__ == '__main__':
     parser.add_argument('--log_dir', default='train_log')
     args = parser.parse_args()
     args.action_size = get_gym_env(args.env_name).action_space.n
+    assert args.predict_thread * args.predict_batch < args.workers
     logger.info(args)
 
     workers = [AgentWorker(i, args) for i in range(args.workers)]

@@ -3,7 +3,7 @@ from umr.utils import get_gym_env
 from umr.a3c.model import A3C
 import numpy as np
 
-env_name = "Breakout-v5"
+env_name = "SpaceInvaders-v5"
 
 env = get_gym_env(f"ALE/{env_name}", render_mode="human", is_train=False)
 
