@@ -1,3 +1,5 @@
+import time
+
 import tensorflow as tf
 from tensorboardX import SummaryWriter
 import multiprocessing as mp
@@ -180,7 +182,6 @@ class AgentMaster(Thread):
         self.score = deque(maxlen=50)
         self.episode_steps = deque(maxlen=50)
         self.episode = 0
-
         self.predictors = MultiThreadAsyncPredictor(self.model, batch_size=args.predict_batch, predict_thread=args.predict_thread)
         self.predictors.start()
 
@@ -254,7 +255,7 @@ class AgentMaster(Thread):
                                                                 tf.TensorSpec(shape=(), dtype=tf.float32),
                                                                 tf.TensorSpec(shape=(), dtype=tf.float32),
                                                                 )).batch(
-            self.args.batch_size).prefetch(self.args.epoch_size)  # .cache().prefetch(tf.data.AUTOTUNE)
+            self.args.batch_size).prefetch(tf.data.AUTOTUNE)  # .cache().prefetch(tf.data.AUTOTUNE)
 
     @tf.function
     def __train_step(self, data, epoch):
@@ -299,16 +300,16 @@ class AgentMaster(Thread):
             self.writer.add_scalar('client/max_score', max_score, step)
             self.writer.add_scalar('client/episode_steps', np.mean(self.episode_steps), self.episode)
             self.writer.add_scalar('client/queue_length', self.queue.qsize(), step)
-            if mean_score > best_score:
+            if max_score > best_score:
                 self.model.save_weights(os.path.join(self.log_dir, 'checkpoints'))
-                best_score = mean_score
+                best_score = max_score
 
 
 def get_beta(epoch):
-    if epoch < 200:
-        return 0.005
+    if epoch < 100:
+        return 0.01
     else:
-        return 0.002
+        return 0.005
 
 
 if __name__ == '__main__':
@@ -332,7 +333,7 @@ if __name__ == '__main__':
     parser.add_argument('--log_dir', default='train_log')
     args = parser.parse_args()
     args.action_size = get_gym_env(args.env_name).action_space.n
-    assert args.predict_thread * args.predict_batch < args.workers
+    # assert args.predict_thread * args.predict_batch < args.workers
     logger.info(args)
 
     workers = [AgentWorker(i, args) for i in range(args.workers)]
